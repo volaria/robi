@@ -17,6 +17,7 @@ class CoreAction(Enum):
     SAY_ACK = auto()
     START_LISTEN = auto()
     RESPOND_TEXT = auto()
+    START_THINKING = auto()
     ASK_IDENTITY = auto()
     SAY_SLEEP = auto()
 
@@ -25,6 +26,7 @@ class CoreAction(Enum):
 class State(Enum):
     IDLE = auto()
     LISTENING = auto()
+    THINKING = auto()
     SPEAKING = auto()
     AUTO_LISTEN = auto()
     WAITING_FOR_NAME = auto()
@@ -34,6 +36,7 @@ class State(Enum):
 class EventType(Enum):
     WAKE_WORD = auto()
     AUDIO_TEXT = auto()
+    RESPONSE_READY = auto()
     SPEAK_DONE = auto()
     TIMEOUT = auto()
     PERSON_DETECTED = auto()
@@ -103,9 +106,9 @@ class RobiCore:
                     print(f"[CORE] -> state={self.state.name} (empty text)")
                     return CoreAction.START_LISTEN
 
-                self.state = State.SPEAKING
+                self.state = State.THINKING
                 print(f"[CORE] -> state={self.state.name}")
-                return CoreAction.RESPOND_TEXT
+                return CoreAction.START_THINKING
 
             if event.type == EventType.TIMEOUT:
                 self.state = State.AUTO_LISTEN
@@ -130,6 +133,16 @@ class RobiCore:
             return CoreAction.NONE
 
         # =========================
+        # THINKING
+        # =========================
+        if self.state == State.THINKING:
+            if event.type == EventType.RESPONSE_READY:
+                self.state = State.SPEAKING
+                print(f"[CORE] -> state={self.state.name}")
+                return CoreAction.RESPOND_TEXT
+            return CoreAction.NONE
+
+        # =========================
         # AUTO_LISTEN (pasif ama mic açık)
         # =========================
         if self.state == State.AUTO_LISTEN:
@@ -147,9 +160,9 @@ class RobiCore:
                     print("[CORE] AUTO_LISTEN -> re-listen after empty text")
                     return CoreAction.START_LISTEN
 
-                self.state = State.SPEAKING
+                self.state = State.THINKING
                 print(f"[CORE] -> state={self.state.name}")
-                return CoreAction.RESPOND_TEXT
+                return CoreAction.START_THINKING
 
             # Tek seans dinleme time-out olduysa tekrar LISTEN
             if event.type == EventType.TIMEOUT:

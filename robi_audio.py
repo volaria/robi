@@ -72,7 +72,7 @@ class AudioCfg:
     sample_rate: int = 16000
     channels: int = 1
     frame_ms: int = 20
-    vad_mode: int = 1
+    vad_mode: int = 2
 
     # wake
     wake_grammar: Optional[List[str]] = None
@@ -80,15 +80,18 @@ class AudioCfg:
     wake_cooldown: float = 1.2
 
     # listening
-    listen_max_sec: float = 8.0
-    end_silence_ms: int = 700
-    min_speech_ms: int = 400
+    listen_max_sec: float = 6.0
+    end_silence_ms: int = 400
+    min_speech_ms: int = 250
 
     debug: bool = False
+    stt_min_confidence: float = 0.55
+    stt_min_chars: int = 3
 
 
 def now_ts() -> float:
     return time.time()
+
 
 
 # -----------------------------
@@ -183,14 +186,24 @@ class SttRecognizer:
         self.rec = KaldiRecognizer(model, cfg.sample_rate)
         self.rec.SetWords(False)
 
-    def transcribe(self, utt: bytes) -> str:
+    def transcribe(self, utt: bytes) -> dict:
         self.rec.Reset()
         for i in range(0, len(utt), 4000):
             self.rec.AcceptWaveform(utt[i:i + 4000])
 
         data = json.loads(self.rec.FinalResult() or "{}")
-        return (data.get("text") or "").strip()
-
+        text = (data.get("text") or "").strip()
+        words = data.get("result") if isinstance(data.get("result"), list) else []
+        conf = None
+        if words:
+            confs = [
+                w.get("conf")
+                for w in words
+                if isinstance(w, dict) and isinstance(w.get("conf"), (int, float))
+            ]
+            if confs:
+                conf = sum(confs) / len(confs)
+        return {"text": text, "confidence": conf, "words": words}
 
 # -----------------------------
 # Main audio service (single mic owner)
@@ -360,17 +373,64 @@ class RobiAudio:
 
                     # 🔒 text HER ZAMAN tanımlı
                     text = ""
+                    raw_text = ""
+                    confidence = None
+                    words = []
 
                     try:
-                        text = self.stt.transcribe(utt) or ""
-                        print("[AUDIO][STT]", repr(text))
+                        result = self.stt.transcribe(utt)
+                        raw_text = result.get("text", "") or ""
+                        text = raw_text
+                        confidence = result.get("confidence")
+                        words = result.get("words") or []
+                        if text and confidence is not None and confidence < self.cfg.stt_min_confidence:
+                            if self.cfg.debug:
+                                print(
+                                    "[AUDIO][STT][FILTER]",
+                                    "low confidence",
+                                    confidence,
+                                    "text=",
+                                    repr(text),
+                                )
+                            text = ""
+                        if text and len(text) < self.cfg.stt_min_chars:
+                            if self.cfg.debug:
+                                print(
+                                    "[AUDIO][STT][FILTER]",
+                                    "too short",
+                                    len(text),
+                                    "text=",
+                                    repr(text),
+                                )
+                            text = ""
+                        if text:
+                            print("[AUDIO][STT]", repr(text))
+                        else:
+                            print("[AUDIO][STT] (empty)")
+                        if self.cfg.debug:
+                            print(
+                                "[AUDIO][STT][DETAIL]",
+                                "conf=",
+                                confidence,
+                                "words=",
+                                len(words),
+                                "raw=",
+                                repr(raw_text),
+                            )
                         if self.cfg.debug:
                             print("[AUDIO] 🗣 STT:", repr(text))
                     except Exception as e:
                         print("[AUDIO][ERR] STT failed:", e)
 
                     # ✅ UTTERANCE'ı mutlaka publish et (boş bile olsa)
-                    self._publish("UTTERANCE", text=text)
+                    self._publish("UTTERANCE", text=text, confidence=confidence, words=words)
+
+                    if not text and not self.listen_continuous:
+                        # boş transkripsiyon: tek seferlik dinlemede WAKE'e dönme,
+                        # kısa bir pencere daha dinlemeye devam et
+                        self._listen_started_at = now_ts()
+                        self.seg_listen.reset()
+                        continue
 
                     if self.listen_continuous:
                         self._listen_started_at = now_ts()
@@ -382,11 +442,9 @@ class RobiAudio:
                         self.seg_wake.reset()
                         self.seg_listen.reset()
                     continue
-
         finally:
             self._stop_arecord()
             print("[AUDIO] \n🎧 ROBI Audio offline")
-
 
 # -----------------------------
 # CLI555

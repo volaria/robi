@@ -23,6 +23,7 @@ class RobiBrain:
     def __init__(self):
         self.bus = BusClient(BUS_SOCKET)
         self.core = RobiCore()
+        self._pending_reply = ""
 
         # 🧠 Conversational memory (v11 ruhu)
         self.messages = [
@@ -66,7 +67,7 @@ class RobiBrain:
             self.bus.publish({"type": "LISTEN", "ts": time.time(), "mode": mode})
             return
 
-        if action == CoreAction.RESPOND_TEXT:
+        if action == CoreAction.START_THINKING:
             user_text = (event_payload or {}).get("text", "").strip()
             if not user_text:
                 return
@@ -78,11 +79,21 @@ class RobiBrain:
                     model="gpt-5",
                     input=self.messages,
                 )
-                reply = (resp.output_text or "").strip()
+                self._pending_reply = (resp.output_text or "").strip()
             except Exception:
-                reply = "Şu an düşünemiyorum."
+                self._pending_reply = "Şu an düşünemiyorum."
 
-            self.messages.append({"role": "assistant", "content": reply})
+            self.messages.append({"role": "assistant", "content": self._pending_reply})
+
+            action = self.core.handle_event(Event(EventType.RESPONSE_READY))
+            self.apply_action(action)
+            return
+
+        if action == CoreAction.RESPOND_TEXT:
+            reply = (self._pending_reply or "").strip()
+            if not reply:
+                reply = "Şu an düşünemiyorum."
+            self._pending_reply = ""
 
             print(f"[ROBI] 🤖 {reply}")
 
