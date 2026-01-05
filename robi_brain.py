@@ -8,7 +8,7 @@ from openai import OpenAI
 
 from robi_bus import BusClient
 from robi_speech import speak, speaking_now
-from robi_core import CoreAction, Event, EventType, RobiCore
+from robi_core import CoreAction, Event, EventType, RobiCore, State
 from robi_constants import BUS_SOCKET
 
 client = OpenAI()
@@ -56,16 +56,14 @@ class RobiBrain:
             self._wait_tts_end()
 
             # konuşma bitti bilgisini Core'a ver
-            self.core.handle_event(Event(EventType.SPEAK_DONE))
-
-            # 🔑 AUTO_LISTEN / devam konuşması için mic'i tekrar aç
-            print("[BRAIN] RESPOND_TEXT -> LISTEN")
-            self.bus.publish({"type": "LISTEN", "ts": time.time()})
+            action = self.core.handle_event(Event(EventType.SPEAK_DONE))
+            self.apply_action(action)
             return
 
         if action == CoreAction.START_LISTEN:
-            print("[BRAIN][DEBUG] START_LISTEN -> publish LISTEN")
-            self.bus.publish({"type": "LISTEN", "ts": time.time()})
+            mode = "auto" if self.core.state == State.AUTO_LISTEN else "once"
+            print(f"[BRAIN][DEBUG] START_LISTEN -> publish LISTEN ({mode})")
+            self.bus.publish({"type": "LISTEN", "ts": time.time(), "mode": mode})
             return
 
         if action == CoreAction.RESPOND_TEXT:
@@ -91,7 +89,8 @@ class RobiBrain:
             speak(reply)
             self._wait_tts_end()
 
-            self.core.handle_event(Event(EventType.SPEAK_DONE))
+            action = self.core.handle_event(Event(EventType.SPEAK_DONE))
+            self.apply_action(action)
             return
 
     # -----------------------------

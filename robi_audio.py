@@ -213,6 +213,7 @@ class RobiAudio:
 
         self.state = self.STATE_IDLE
         self.cooldown_until = 0.0
+        self.listen_continuous = False
 
         self.seg_wake = Segmenter(cfg, max_sec=2.2)
         self.seg_listen = Segmenter(cfg, max_sec=cfg.listen_max_sec)
@@ -280,6 +281,7 @@ class RobiAudio:
                     if self.cfg.debug:
                         print("[AUDIO] 🎧 Audio got LISTEN -> LISTENING")
                     self.state = self.STATE_LISTENING
+                    self.listen_continuous = ev.get("mode") == "auto"
                     self.seg_listen.reset()
                     self.seg_wake.reset()  # ⛔️ wake buffer tamamen sıfırlansın
                     self._listen_started_at = now_ts()
@@ -346,10 +348,14 @@ class RobiAudio:
                             if self.cfg.debug:
                                 print("[AUDIO] ⏱️ LISTEN timeout -> publish TIMEOUT")
                             self._publish("TIMEOUT")
-                            self.cooldown_until = now_ts() + 0.8
-                            self.state = self.STATE_IDLE
-                            self.seg_wake.reset()
-                            self.seg_listen.reset()
+                            if self.listen_continuous:
+                                self._listen_started_at = now_ts()
+                                self.seg_listen.reset()
+                            else:
+                                self.cooldown_until = now_ts() + 0.8
+                                self.state = self.STATE_IDLE
+                                self.seg_wake.reset()
+                                self.seg_listen.reset()
                         continue
 
                     # 🔒 text HER ZAMAN tanımlı
@@ -366,11 +372,15 @@ class RobiAudio:
                     # ✅ UTTERANCE'ı mutlaka publish et (boş bile olsa)
                     self._publish("UTTERANCE", text=text)
 
-                    # ✅ tek seferlik dinleme bitti: tekrar WAKE moduna dön
-                    self.cooldown_until = now_ts() + 0.8
-                    self.state = self.STATE_IDLE
-                    self.seg_wake.reset()
-                    self.seg_listen.reset()
+                    if self.listen_continuous:
+                        self._listen_started_at = now_ts()
+                        self.seg_listen.reset()
+                    else:
+                        # ✅ tek seferlik dinleme bitti: tekrar WAKE moduna dön
+                        self.cooldown_until = now_ts() + 0.8
+                        self.state = self.STATE_IDLE
+                        self.seg_wake.reset()
+                        self.seg_listen.reset()
                     continue
 
         finally:

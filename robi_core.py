@@ -90,7 +90,19 @@ class RobiCore:
         # LISTENING
         # =========================
         if self.state == State.LISTENING:
+            if event.type == EventType.SPEAK_DONE:
+                print("[CORE] LISTENING -> start listen after ack")
+                return CoreAction.START_LISTEN
+
             if event.type == EventType.AUDIO_TEXT:
+                text = (event.payload or {}).get("text", "").strip()
+                if not text:
+                    self.state = State.AUTO_LISTEN
+                    self.auto_listen_started_at = time.time()
+                    self.auto_listen_listening = False
+                    print(f"[CORE] -> state={self.state.name} (empty text)")
+                    return CoreAction.START_LISTEN
+
                 self.state = State.SPEAKING
                 print(f"[CORE] -> state={self.state.name}")
                 return CoreAction.RESPOND_TEXT
@@ -121,23 +133,35 @@ class RobiCore:
         # AUTO_LISTEN (pasif ama mic açık)
         # =========================
         if self.state == State.AUTO_LISTEN:
+            # AUTO_LISTEN sırasında WAKE gelirse: ACK yok, sadece yeniden LISTEN
+            if event.type == EventType.WAKE_WORD:
+                self.auto_listen_listening = False
+                print("[CORE] AUTO_LISTEN -> re-listen after WAKE")
+                return CoreAction.START_LISTEN
+
+            # Kullanıcı konuştu
+            if event.type == EventType.AUDIO_TEXT:
+                text = (event.payload or {}).get("text", "").strip()
+                if not text:
+                    self.auto_listen_listening = False
+                    print("[CORE] AUTO_LISTEN -> re-listen after empty text")
+                    return CoreAction.START_LISTEN
+
+                self.state = State.SPEAKING
+                print(f"[CORE] -> state={self.state.name}")
+                return CoreAction.RESPOND_TEXT
+
+            # Tek seans dinleme time-out olduysa tekrar LISTEN
+            if event.type == EventType.TIMEOUT:
+                self.auto_listen_listening = False
+                print("[CORE] AUTO_LISTEN -> re-listen after TIMEOUT")
+                return CoreAction.START_LISTEN
+
             # Mic'in açık olduğundan emin ol (bir kere)
             if not self.auto_listen_listening:
                 self.auto_listen_listening = True
                 print("[CORE] AUTO_LISTEN -> ensure LISTEN")
                 return CoreAction.START_LISTEN
-
-            # WAKE ile aktif moda dön
-            if event.type == EventType.WAKE_WORD:
-                self.state = State.LISTENING
-                print(f"[CORE] -> state={self.state.name} (wake from auto_listen)")
-                return CoreAction.SAY_ACK
-
-            # Kullanıcı konuştu
-            if event.type == EventType.AUDIO_TEXT:
-                self.state = State.SPEAKING
-                print(f"[CORE] -> state={self.state.name}")
-                return CoreAction.RESPOND_TEXT
 
             # Uzun sessizlik → uyku mesajı
             if (
