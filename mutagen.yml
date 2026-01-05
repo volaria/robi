@@ -1,0 +1,11 @@
+sync:
+  ignore:
+    vcs: true
+    paths:
+      - venv311
+      - __pycache__
+      - vosk-model*
+      - *.wav
+      - memory.json
+      - .cache
+      - .git
