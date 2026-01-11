@@ -87,6 +87,8 @@ class AudioCfg:
     debug: bool = False
     stt_min_confidence: float = 0.55
     stt_min_chars: int = 3
+    tts_resume_delay_ms: int = 700
+    tts_flush_on_end: bool = True
 
 
 def now_ts() -> float:
@@ -233,6 +235,8 @@ class RobiAudio:
 
         self.frame_bytes = int(cfg.sample_rate * (cfg.frame_ms / 1000.0) * 2)
         self._arecord = None
+        self.tts_mute_until = 0.0
+        self._flush_arecord = False
 
     def _start_arecord(self):
         cmd = [
@@ -262,6 +266,15 @@ class RobiAudio:
             p.terminate()
         except Exception:
             pass
+        try:
+            p.wait(timeout=0.5)
+        except Exception:
+            pass
+
+    def _restart_arecord(self):
+        self._stop_arecord()
+        time.sleep(0.05)
+        self._start_arecord()
 
     def _publish(self, typ: str, **payload):
         # 1) Legacy bus event (Brain/Core bunu bekliyor)
@@ -305,6 +318,19 @@ class RobiAudio:
                     if self.cfg.debug:
                         print("[AUDIO] 🔇 Audio got TTS_START (mic muted)")
                     self.seg_wake.reset()
+                    self.tts_mute_until = max(self.tts_mute_until, now_ts())
+                    continue
+                if ev and ev.get("type") == "TTS_END":
+                    if self.cfg.debug:
+                        print("[AUDIO] 🔈 Audio got TTS_END (resume after delay)")
+                    self.tts_mute_until = max(
+                        self.tts_mute_until,
+                        now_ts() + (self.cfg.tts_resume_delay_ms / 1000.0),
+                    )
+                    if self.cfg.tts_flush_on_end:
+                        self._flush_arecord = True
+                    self.seg_wake.reset()
+                    self.seg_listen.reset()
                     continue
 
                 # Brain iş bitti dedi
@@ -317,14 +343,24 @@ class RobiAudio:
                     self.seg_listen.reset()
                     continue
 
+                if self._flush_arecord:
+                    if self.cfg.debug:
+                        print("[AUDIO] 🧹 Flushing arecord buffer")
+                    self._restart_arecord()
+                    self._flush_arecord = False
+
+                data = self._arecord.stdout.read(self.frame_bytes)
+                if not data or len(data) != self.frame_bytes:
+                    continue
+
                 # 🔇 TTS sırasında mic tamamen kapalı: kendi sesini dinleme
                 if os.path.exists("/tmp/robi_mic.lock"):
                     self.seg_wake.reset()
                     self.seg_listen.reset()
                     continue
-
-                data = self._arecord.stdout.read(self.frame_bytes)
-                if not data or len(data) != self.frame_bytes:
+                if now_ts() < self.tts_mute_until:
+                    self.seg_wake.reset()
+                    self.seg_listen.reset()
                     continue
 
                 # -------- IDLE: Wake bekle --------
