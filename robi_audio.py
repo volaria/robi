@@ -87,6 +87,7 @@ class AudioCfg:
     debug: bool = False
     stt_min_confidence: float = 0.55
     stt_min_chars: int = 3
+    tts_resume_delay_ms: int = 400
 
 
 def now_ts() -> float:
@@ -233,6 +234,7 @@ class RobiAudio:
 
         self.frame_bytes = int(cfg.sample_rate * (cfg.frame_ms / 1000.0) * 2)
         self._arecord = None
+        self.tts_mute_until = 0.0
 
     def _start_arecord(self):
         cmd = [
@@ -305,6 +307,17 @@ class RobiAudio:
                     if self.cfg.debug:
                         print("[AUDIO] 🔇 Audio got TTS_START (mic muted)")
                     self.seg_wake.reset()
+                    self.tts_mute_until = max(self.tts_mute_until, now_ts())
+                    continue
+                if ev and ev.get("type") == "TTS_END":
+                    if self.cfg.debug:
+                        print("[AUDIO] 🔈 Audio got TTS_END (resume after delay)")
+                    self.tts_mute_until = max(
+                        self.tts_mute_until,
+                        now_ts() + (self.cfg.tts_resume_delay_ms / 1000.0),
+                    )
+                    self.seg_wake.reset()
+                    self.seg_listen.reset()
                     continue
 
                 # Brain iş bitti dedi
@@ -319,6 +332,10 @@ class RobiAudio:
 
                 # 🔇 TTS sırasında mic tamamen kapalı: kendi sesini dinleme
                 if os.path.exists("/tmp/robi_mic.lock"):
+                    self.seg_wake.reset()
+                    self.seg_listen.reset()
+                    continue
+                if now_ts() < self.tts_mute_until:
                     self.seg_wake.reset()
                     self.seg_listen.reset()
                     continue

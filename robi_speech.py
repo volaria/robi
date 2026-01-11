@@ -241,6 +241,7 @@ def speak(text: str):
     finally:
         _set_speaking(False)
         _clear_mic_lock()
+        _bus.publish({"type": "TTS_END", "ts": time.time()})
 
         try:
             face_listening()
