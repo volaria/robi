@@ -18,3 +18,17 @@ models/vosk-model-*/
 *.zip
 
 .env
+vision/faces/
+vision/models/*.onnx
+vision/models/embeddings.pkl
+*.jpg
+*.jpeg
+*.JPG
+*.png
+*.PNG
+robi_memory.db
+*.scad
+26.0.1
+hello_robi.txt
+test_frame2.jpg
+cemre26.jpg
