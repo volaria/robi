@@ -3,23 +3,28 @@ set -e
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# venv'ler
-VENV_AUDIO="$BASE_DIR/venv"
-VENV_BRAIN="$BASE_DIR/venv311"
+# ── DMIC overlay gain (isteğe bağlı, /boot/config.txt'de dmic_gain yoksa) ──
+# sndrpii2scard DMIC kartının hardware gain kontrolü yok;
+# yazılım kazancı robi_audio.py içinde SW_GAIN_DB ile ayarlanır.
+
+# venv
+VENV="$BASE_DIR/venv"
 
 # modeller
-WAKE_MODEL="$BASE_DIR/models/vosk-model-small-en-us-0.15"
-STT_MODEL="$BASE_DIR/models/vosk-model-small-tr-0.3"
+WAKE_MODEL="$BASE_DIR/vision/models/vosk-model-small-en-us-0.15"
+STT_MODEL="$BASE_DIR/vision/models/vosk-model-small-tr-0.3"
 
-# BUS + BRAIN (venv311)
-source "$VENV_BRAIN/bin/activate"
+source "$VENV/bin/activate"
+
+# BUS + BRAIN (normal öncelik)
 python robi_bus.py &
 sleep 0.3
 python robi_brain.py &
 sleep 0.3
 
-# AUDIO (venv)
-source "$VENV_AUDIO/bin/activate"
-python robi_audio.py \
-  --wake-model "$WAKE_MODEL" \
-  --stt-model "$STT_MODEL"
+# VISION — düşük CPU önceliği (nice 10): audio ve brain önce alır, vision artan zamanda çalışır
+nice -n 10 python robi_vision.py &
+sleep 0.5
+
+# AUDIO (foreground, yüksek öncelik — çıkınca script biter)
+nice -n -5 python robi_audio.py

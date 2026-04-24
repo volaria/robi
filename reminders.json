@@ -1,0 +1,11 @@
+[
+  {
+    "id": "ef83ea58",
+    "label": "hatırlatıcı",
+    "hour": 14,
+    "minute": 0,
+    "repeat": "once",
+    "date": "2026-03-16",
+    "active": true
+  }
+]

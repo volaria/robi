@@ -34,7 +34,7 @@ def servo_goto(angle: int, hold: float = 0.30):
     angle = _clamp(angle)
     _pwm.ChangeDutyCycle(_angle_to_duty(angle))
     time.sleep(hold)
-    _pwm.ChangeDutyCycle(0)
+    # ChangeDutyCycle(0) kaldırıldı — sinyal kesilince SG90 pozisyon tutamıyor (hunt/titreşim)
 
 def servo_center():
     servo_goto(CENTER_ANGLE, 0.35)

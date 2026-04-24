@@ -4,8 +4,8 @@ sync:
     paths:
       - venv311
       - __pycache__
-      - vosk-model*
-      - *.wav
+      - "vosk-model*"
+      - "*.wav"
       - memory.json
       - .cache
       - .git

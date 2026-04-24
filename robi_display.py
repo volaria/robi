@@ -131,6 +131,15 @@ idle_frames = [
     _zeros()
 ]
 
+# Konuşma bitti — "sıra sende" flash (2x kısa parlama)
+_full = [[1]*8 for _ in range(8)]
+done_frames = [
+    _full,
+    _zeros(),
+    _full,
+    _zeros(),
+]
+
 # -----------------------------
 # PUBLIC API
 # -----------------------------
@@ -149,3 +158,7 @@ def idle():
 
 def clear():
     _start([_zeros()], loop=False)
+
+def done():
+    """ROBI konuşmayı bitirdi — kısa çift flash. Döngüsüz, ~320ms sürer."""
+    _start(done_frames, delay=0.08, loop=False)

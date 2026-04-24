@@ -1,250 +1,224 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-robi_speech.py
-Tek işi: ROBI'yi konuşturmak (TTS) + (opsiyonel) LED yüz senkronu
-- speaking_now() doğru çalışır
-- mic lock yönetir: /tmp/robi_mic.lock
-- bus'a TTS_START yayar (audio mic mute için)
+robi_speech.py — ROBI TTS Servisi
+En büyük hız kazanımı burada:
+  OpenAI TTS PCM formatında stream eder → doğrudan aplay pipe'ına yazar.
+  Dosya yazma/okuma yoktur → ilk ses ~500ms içinde çıkar.
+
+speak(text)       — senkron konuşur (thread içinde çağırılmalı)
+stop_speaking()   — o anki konuşmayı keser
+speaking_now()    — True/False
 """
 
 from __future__ import annotations
 
-import json
 import os
-import socket
 import subprocess
 import threading
 import time
 from typing import Optional
-from robi_constants import BUS_SOCKET
 
+from openai import OpenAI
 
-MIC_LOCK_PATH = "/tmp/robi_mic.lock"
-TTS_WAV_PATH = "tts.wav"
+from config import (
+    AUDIO_PLAYBACK_DEVICE, BUS_SOCKET,
+    TTS_FORMAT, TTS_MODEL, TTS_SAMPLE_RATE, TTS_VOICE,
+)
+from robi_bus import BusClient
 
-# -----------------------------
-# Optional HW face hooks
-# -----------------------------
-USE_HW = False
+# ─── Konuşma bitti sinyali ────────────────────────────────────────────────────
 
-if USE_HW:
+def play_end_chime() -> None:
+    """
+    ROBI konuşmasını bitirince kısa 'tık' sesi çalar ve LED'i flaşlatır.
+    ~180ms sürer, bloklar (speak() içinden çağrılır).
+    """
+    import numpy as _np
+
+    # 180ms, 880Hz (A5) — fade-in/out ile yumuşatılmış
+    _sr       = TTS_SAMPLE_RATE   # 24000 Hz
+    _dur      = 0.18
+    _freq     = 880
+    _vol      = 0.25              # 0..1 arası ses seviyesi
+    t         = _np.linspace(0, _dur, int(_sr * _dur), endpoint=False)
+    wave      = _np.sin(2 * _np.pi * _freq * t) * _vol
+    fade      = int(_sr * 0.025)  # 25ms fade-in/out
+    wave[:fade]  *= _np.linspace(0, 1, fade)
+    wave[-fade:] *= _np.linspace(1, 0, fade)
+    pcm = (wave * 32767).astype(_np.int16).tobytes()
+
+    # Ses çal
     try:
-        from robi_hw import face_thinking, face_speaking, face_listening, anim_transition
+        p = subprocess.Popen(
+            ["aplay", "-f", "S16_LE", "-r", str(_sr), "-c", "1",
+             "-D", AUDIO_PLAYBACK_DEVICE, "-"],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        p.stdin.write(pcm)
+        p.stdin.close()
+        p.wait(timeout=1)
     except Exception:
-        USE_HW = False
+        pass
 
-if not USE_HW:
-    def face_thinking(): ...
-    def face_speaking(): ...
-    def face_listening(): ...
-    def anim_transition(*a, **k): ...
-
-
-# -----------------------------
-# Optional OpenAI TTS
-# -----------------------------
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:
-    OpenAI = None  # type: ignore
-
-_client = None
-
-def _get_openai_client():
-    global _client
-    if _client is None:
-        if OpenAI is None:
-            return None
-        _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        print("[SPEECH][DEBUG] OpenAI client created with key:",
-              os.getenv("OPENAI_API_KEY")[:8], "...")
-    return _client
-
-print("[SPEECH] OPENAI_API_KEY in env:", bool(os.getenv("OPENAI_API_KEY")))
+    # LED flash (opsiyonel — display yoksa sessizce geç)
+    try:
+        import robi_display as _disp
+        _disp.done()
+    except Exception:
+        pass
 
 
-# -----------------------------
-# Minimal bus publisher (best-effort)
-# -----------------------------
-class _BusPub:
-    def __init__(self, sock_path: str):
-        self.sock_path = sock_path
-        self._sock: Optional[socket.socket] = None
+# ─── State ────────────────────────────────────────────────────────────────────
 
-    def _ensure(self):
-        if self._sock is not None:
-            return
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(self.sock_path)
-        s.sendall(b"PUB\n")
-        self._sock = s
+_lock      = threading.Lock()
+_speaking  = False
+_stop_flag = False
+_proc: Optional[subprocess.Popen] = None
 
-    def publish(self, ev: dict):
-        try:
-            if not os.path.exists(self.sock_path):
-                return
-            self._ensure()
-            line = (json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
-            self._sock.sendall(line)
-        except Exception:
-            # bus yoksa / koparsa konuşmayı engellemeyelim
+# ─── Bus yayıncısı (best-effort) ──────────────────────────────────────────────
+# Speech modülü brain ile aynı process'te çalışabileceğinden
+# bus bağlantısı tembel (lazy) açılır.
+
+_bus: Optional[BusClient] = None
+_bus_lock = threading.Lock()
+
+
+def _get_bus() -> Optional[BusClient]:
+    global _bus
+    with _bus_lock:
+        if _bus is None:
             try:
-                if self._sock:
-                    self._sock.close()
+                _bus = BusClient(BUS_SOCKET)
             except Exception:
                 pass
-            self._sock = None
+    return _bus
 
 
-_bus = _BusPub(BUS_SOCKET)
+def _pub(ev: dict) -> None:
+    b = _get_bus()
+    if b:
+        try:
+            b.publish(ev)
+        except Exception:
+            pass
 
 
-# -----------------------------
-# State
-# -----------------------------
-_state_lock = threading.Lock()
-_is_speaking = False
-_stop_flag = False
-_tts_process: Optional[subprocess.Popen] = None
+# ─── OpenAI istemcisi ─────────────────────────────────────────────────────────
 
+_oai: Optional[OpenAI] = None
+_oai_lock = threading.Lock()
+
+
+def _get_oai() -> OpenAI:
+    global _oai
+    with _oai_lock:
+        if _oai is None:
+            _oai = OpenAI()
+    return _oai
+
+
+# ─── Public API ───────────────────────────────────────────────────────────────
 
 def speaking_now() -> bool:
-    with _state_lock:
-        return _is_speaking
+    with _lock:
+        return _speaking
 
 
-def _set_speaking(v: bool):
-    global _is_speaking
-    with _state_lock:
-        _is_speaking = v
-
-
-def _touch_mic_lock():
-    try:
-        with open(MIC_LOCK_PATH, "w", encoding="utf-8") as f:
-            f.write(str(time.time()))
-    except Exception:
-        pass
-
-
-def _clear_mic_lock():
-    try:
-        if os.path.exists(MIC_LOCK_PATH):
-            os.remove(MIC_LOCK_PATH)
-    except Exception:
-        pass
-
-
-def _fallback_say(text: str) -> bool:
-    """
-    OpenAI yoksa: espeak-ng / espeak ile gerçek ses.
-    """
-    text = (text or "").strip()
-    if not text:
-        return False
-
-    # Önce espeak-ng
-    for cmd in (
-        ["espeak-ng", "-v", "tr", "-s", "155", text],
-        ["espeak", "-v", "tr", "-s", "155", text],
-    ):
-        try:
-            subprocess.run(cmd, check=True)
-            return True
-        except Exception:
-            continue
-
-    # Son çare: sadece log
-    print(f"[SPEECH][TTS:FALLBACK] {text}")
-    return False
-
-
-def stop_speaking():
-    global _stop_flag, _tts_process
+def stop_speaking() -> None:
+    global _stop_flag, _proc
     _stop_flag = True
-    _set_speaking(False)
-
-    try:
-        if _tts_process and _tts_process.poll() is None:
-            _tts_process.terminate()
-    except Exception:
-        pass
-
-    _clear_mic_lock()
-    try:
-        face_listening()
-    except Exception:
-        pass
+    with _lock:
+        p = _proc
+    if p and p.poll() is None:
+        try: p.stdin.close()
+        except Exception: pass
+        try: p.terminate()
+        except Exception: pass
 
 
-def speak(text: str):
+def speak(text: str) -> None:
     """
-    Senkron konuşur: bittiğinde geri döner.
+    Senkron TTS. Bitene kadar bloklar.
+    Brain içinde her zaman ayrı bir thread'den çağırılmalı.
     """
-    global _stop_flag, _tts_process
+    global _speaking, _stop_flag, _proc
 
     text = (text or "").strip()
     if not text:
         return
 
-    _stop_flag = False
-    _set_speaking(True)
+    with _lock:
+        if _speaking:
+            return           # başka bir konuşma sürüyorsa atla
+        _speaking  = True
+        _stop_flag = False
 
-    # mic'i kilitle + audio mic mute
-    _touch_mic_lock()
-    _bus.publish({"type": "TTS_START", "ts": time.time()})
+    _pub({"type": "TTS_START", "ts": time.time()})
 
     try:
-        # yüz animasyonu
+        # aplay: stdin'den raw PCM oku → hoparlöre çal
+        aplay_cmd = [
+            "aplay",
+            "-f", "S16_LE",
+            "-r", str(TTS_SAMPLE_RATE),
+            "-c", "1",
+            "-D", AUDIO_PLAYBACK_DEVICE,
+            "-",             # stdin'den oku
+        ]
+        proc = subprocess.Popen(
+            aplay_cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+        with _lock:
+            _proc = proc
+
+        client = _get_oai()
+
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=text,
+            response_format=TTS_FORMAT,   # "pcm" → raw 24kHz 16-bit mono
+        ) as response:
+            for chunk in response.iter_bytes(chunk_size=4096):
+                if _stop_flag:
+                    break
+                try:
+                    proc.stdin.write(chunk)
+                except BrokenPipeError:
+                    break
+
         try:
-            face_thinking()
-            anim_transition()
-            face_speaking()
+            proc.stdin.close()
         except Exception:
             pass
 
-        # ---------- OpenAI TTS ----------
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY missing")
+        proc.wait()
 
-        client = _get_openai_client()
-        if client is not None:
-            try:
-                with client.audio.speech.with_streaming_response.create(
-                    model="gpt-4o-mini-tts",
-                    voice="verse",
-                    input=text,
-                    response_format="wav",
-                ) as response:
-                    response.stream_to_file(TTS_WAV_PATH)
-
-                _tts_process = subprocess.Popen(["aplay", TTS_WAV_PATH])
-
-                while _tts_process.poll() is None:
-                    if _stop_flag:
-                        try:
-                            _tts_process.terminate()
-                        except Exception:
-                            pass
-                        break
-                    time.sleep(0.05)
-
-                return
-            except Exception as e:
-                print("[SPEECH] TTS(OpenAI) error:", e)
-
-
-        # ---------- Fallback (espeak) ----------
-        _fallback_say(text)
+    except Exception as e:
+        print(f"[SPEECH] ⚠ TTS hatası: {e}")
+        # Fallback: espeak
+        _fallback(text)
 
     finally:
-        _set_speaking(False)
-        _clear_mic_lock()
+        with _lock:
+            _speaking  = False
+            _stop_flag = False
+            _proc      = None
+        _pub({"type": "TTS_END", "ts": time.time()})
 
+
+def _fallback(text: str) -> None:
+    """OpenAI çalışmazsa espeak ile konuş."""
+    for cmd in (
+        ["espeak-ng", "-v", "tr", "-s", "145", text],
+        ["espeak",    "-v", "tr", "-s", "145", text],
+    ):
         try:
-            face_listening()
+            subprocess.run(cmd, check=True, timeout=15)
+            return
         except Exception:
-            pass
-
-        time.sleep(0.05)
+            continue
+    print(f"[SPEECH][FALLBACK] {text}")
